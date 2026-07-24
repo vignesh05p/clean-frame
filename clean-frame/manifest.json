@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "CleanFrame",
+  "short_name": "CleanFrame",
+  "version": "0.1.0",
+  "description": "CleanFrame - Client-side high-resolution video watermark remover for Google Flow.",
+  "icons": {
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "CleanFrame",
+    "default_icon": {
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://labs.google.com/fx/tools/flow*",
+        "https://labs.google/fx/tools/flow*"
+      ],
+      "js": ["config.js", "source-resolver.js", "ui-injector.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "permissions": [
+    "activeTab",
+    "storage",
+    "offscreen",
+    "downloads",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "https://labs.google.com/*",
+    "https://labs.google/*",
+    "https://*.googleusercontent.com/*",
+    "https://storage.googleapis.com/*",
+    "https://*.googleapis.com/*",
+    "https://*.ggpht.com/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "offscreen.html",
+        "offscreen.js",
+        "streaming-pipeline.js",
+        "webgl-processor.js",
+        "config.js",
+        "lib/mp4box.min.js",
+        "icons/icon-128.png"
+      ],
+      "matches": [
+        "https://labs.google.com/*",
+        "https://labs.google/*"
+      ]
+    }
+  ],
+  "minimum_chrome_version": "116"
+}
