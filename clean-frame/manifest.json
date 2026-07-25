@@ -20,7 +20,9 @@
     {
       "matches": [
         "https://labs.google.com/fx/tools/flow*",
-        "https://labs.google/fx/tools/flow*"
+        "https://labs.google/fx/tools/flow*",
+        "https://gemini.google.com/*",
+        "https://www.gemini.google.com/*"
       ],
       "js": ["config.js", "source-resolver.js", "ui-injector.js", "content.js"],
       "run_at": "document_idle",
@@ -37,10 +39,15 @@
   "host_permissions": [
     "https://labs.google.com/*",
     "https://labs.google/*",
+    "https://labs.google/fx/api/trpc/*",
+    "https://gemini.google.com/*",
+    "https://www.gemini.google.com/*",
     "https://*.googleusercontent.com/*",
     "https://storage.googleapis.com/*",
     "https://*.googleapis.com/*",
-    "https://*.ggpht.com/*"
+    "https://*.ggpht.com/*",
+    "https://*.flow-content.google/*",
+    "https://flow-content.google/*"
   ],
   "web_accessible_resources": [
     {
@@ -51,11 +58,14 @@
         "webgl-processor.js",
         "config.js",
         "lib/mp4box.min.js",
-        "icons/icon-128.png"
+        "icons/icon-128.png",
+        "gemini-mask.png"
       ],
       "matches": [
         "https://labs.google.com/*",
-        "https://labs.google/*"
+        "https://labs.google/*",
+        "https://gemini.google.com/*",
+        "https://www.gemini.google.com/*"
       ]
     }
   ],

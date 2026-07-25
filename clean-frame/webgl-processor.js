@@ -32,12 +32,14 @@ in vec2 v_uv;
 out vec4 outColor;
 
 uniform sampler2D u_frame;
+uniform sampler2D u_mask;
 uniform vec4 u_box;       // normalized x,y,w,h
 uniform vec3 u_wmColor;
 uniform float u_alpha;
 uniform float u_mode;     // 0 = reverse-alpha, 1 = blur
 uniform vec2 u_texel;     // 1/width, 1/height
 uniform float u_blurRadius;
+uniform float u_maskEnabled;
 
 bool insideBox(vec2 uv, vec4 box) {
   return uv.x >= box.x && uv.x <= box.x + box.z &&
@@ -47,6 +49,15 @@ bool insideBox(vec2 uv, vec4 box) {
 vec3 reverseAlpha(vec3 obs, vec3 wm, float a) {
   float denom = max(1.0 - a, 1e-4);
   return clamp((obs - wm * a) / denom, 0.0, 1.0);
+}
+
+// Sample mask (assumes mask covers the box region when enabled)
+vec4 sampleMask(vec2 uv, vec4 box) {
+  if (u_maskEnabled < 0.5) return vec4(0.0);
+  vec2 local = (uv - vec2(box.x, box.y)) / vec2(box.z, box.w);
+  // clamp to mask space
+  local = clamp(local, 0.0, 1.0);
+  return texture(u_mask, local);
 }
 
 vec3 spatialBlur(sampler2D tex, vec2 uv, vec2 texel, float radius) {
@@ -71,7 +82,15 @@ void main() {
     if (u_mode > 0.5) {
       color.rgb = spatialBlur(u_frame, v_uv, u_texel, u_blurRadius);
     } else {
-      color.rgb = reverseAlpha(color.rgb, u_wmColor, u_alpha);
+      // If mask enabled, use mask color/alpha from texture; otherwise fall back
+      vec4 m = sampleMask(v_uv, u_box);
+      if (u_maskEnabled > 0.5) {
+        vec3 wm = m.rgb;
+        float ma = m.a;
+        color.rgb = reverseAlpha(color.rgb, wm, ma);
+      } else {
+        color.rgb = reverseAlpha(color.rgb, u_wmColor, u_alpha);
+      }
     }
   }
   outColor = vec4(color.rgb, 1.0);
@@ -156,11 +175,15 @@ void main() {
       mode: gl.getUniformLocation(program, 'u_mode'),
       texel: gl.getUniformLocation(program, 'u_texel'),
       blurRadius: gl.getUniformLocation(program, 'u_blurRadius'),
+      maskEnabled: gl.getUniformLocation(program, 'u_maskEnabled'),
+      maskSampler: gl.getUniformLocation(program, 'u_mask'),
     };
 
     let cachedBox = null;
     let detectEveryN = 12;
     let frameIndex = 0;
+    let maskTex = null;
+    let maskLoaded = false;
 
     /**
      * Lightweight CPU detection over the search prior region.
@@ -191,23 +214,40 @@ void main() {
       const target = [tr * 255, tg * 255, tb * 255];
 
       let minX = rw, minY = rh, maxX = 0, maxY = 0, hits = 0, sampled = 0;
+      const platform = profile.platform || (CFG && CFG.platform) || 'flow';
 
       for (let y = 0; y < rh; y += stride) {
+        // Yield occasionally to avoid blocking
+        if (y % 256 === 0) await new Promise((r) => setTimeout(r, 0));
         for (let x = 0; x < rw; x += stride) {
           const i = (y * rw + x) * 4;
-          const r = data[i], g = data[i + 1], b = data[i + 2];
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
           sampled += 1;
-          const dist =
-            Math.abs(r - target[0]) +
-            Math.abs(g - target[1]) +
-            Math.abs(b - target[2]);
-          // Soft match: watermark tint sits near white/gray overlay
-          if (dist < 90 && r + g + b > 480) {
-            hits += 1;
-            if (x < minX) minX = x;
-            if (y < minY) minY = y;
-            if (x > maxX) maxX = x;
-            if (y > maxY) maxY = y;
+
+          if (platform === 'gemini') {
+            const lum = (r + g + b) / 3;
+            const bluish = b - Math.max(r, g);
+            if (lum > 220 && bluish > 6) {
+              hits += 1;
+              if (x < minX) minX = x;
+              if (y < minY) minY = y;
+              if (x > maxX) maxX = x;
+              if (y > maxY) maxY = y;
+            }
+          } else {
+            const dist =
+              Math.abs(r - target[0]) +
+              Math.abs(g - target[1]) +
+              Math.abs(b - target[2]);
+            if (dist < 90 && r + g + b > 480) {
+              hits += 1;
+              if (x < minX) minX = x;
+              if (y < minY) minY = y;
+              if (x > maxX) maxX = x;
+              if (y > maxY) maxY = y;
+            }
           }
         }
       }
@@ -243,6 +283,29 @@ void main() {
       };
     }
 
+    // Load platform mask texture if provided
+    async function loadMaskIfNeeded() {
+      try {
+        const platform = profile.platform || (CFG && CFG.platform) || 'flow';
+        const maskName = (CFG && CFG.platformMasks && CFG.platformMasks[platform]) || null;
+        if (!maskName) return;
+        if (maskLoaded) return;
+        const url = chrome.runtime.getURL(maskName);
+        const img = await fetch(url).then((r) => r.blob()).then((b) => createImageBitmap(b));
+        maskTex = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        maskLoaded = true;
+      } catch (e) {
+        console.warn(LOG_PREFIX, 'mask load failed', e);
+      }
+    }
+
     /**
      * @param {VideoFrame} frame
      * @returns {Promise<VideoFrame>}
@@ -259,6 +322,8 @@ void main() {
 
       // Re-detect periodically — Flow watermarks can drift between shots
       if (!cachedBox || frameIndex % detectEveryN === 0) {
+        // Ensure mask is loaded for platform if needed
+        await loadMaskIfNeeded();
         const detected = await detectWatermark(frame);
         cachedBox = detected;
       }
@@ -285,6 +350,12 @@ void main() {
       gl.uniform1f(uniforms.mode, mode);
       gl.uniform2f(uniforms.texel, 1 / w, 1 / h);
       gl.uniform1f(uniforms.blurRadius, profile.blurRadiusPx ?? 6);
+      gl.uniform1f(uniforms.maskEnabled, maskLoaded ? 1.0 : 0.0);
+      if (maskLoaded) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.uniform1i(uniforms.maskSampler, 1);
+      }
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
@@ -296,6 +367,7 @@ void main() {
 
     function destroy() {
       gl.deleteTexture(tex);
+      if (maskTex) gl.deleteTexture(maskTex);
       gl.deleteBuffer(buf);
       gl.deleteVertexArray(vao);
       gl.deleteProgram(program);

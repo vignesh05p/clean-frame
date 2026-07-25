@@ -2,6 +2,9 @@
  * CleanFrame — content script entry.
  * Owns MutationObserver lifecycle, HD source resolution, and relays
  * process requests to the background → offscreen pipeline.
+ *
+ * Messaging is fire-and-forget: PROCESS_VIDEO only waits for { status:'started' }.
+ * Progress / done / error arrive as separate chrome.runtime.onMessage events.
  */
 (function () {
   'use strict';
@@ -31,8 +34,8 @@
   }
 
   /**
-   * Hunt down the highest-resolution MP4 for this card, then hand it to
-   * the offscreen streaming pipeline (extension host_permissions bypass page CORS).
+   * Hunt down the highest-resolution MP4 for this card, then kick off
+   * the offscreen pipeline without holding the message port open.
    */
   async function onCleanFrameClick(btn, card) {
     if (btn.getAttribute(CFG.ui.processingAttr) === '1') return;
@@ -47,7 +50,29 @@
       resolved = await UI.getHighResVideoUrl(card);
     } catch (err) {
       console.error('[CleanFrame:content] HD source resolution failed', err);
-      UI.setButtonState(btn, 'error');
+
+      const errorMessage = String(err.message || err);
+
+      // 1. Handle Zombie Tabs (Extension Context Invalidated)
+      if (errorMessage.includes('Extension context invalidated')) {
+        UI.setButtonState(btn, 'error');
+        UI.setButtonProgress(btn, 1.0, 'Extension updated. Please refresh page!');
+      }
+      // 2. Handle Phantom Click Failure / Hidden Videos
+      else if (errorMessage.includes('No video URL found')) {
+        UI.setButtonState(btn, 'error');
+        UI.setButtonProgress(btn, 1.0, 'Click Flow Download First!');
+
+        setTimeout(() => {
+          UI.setButtonState(btn, 'ready');
+          UI.setButtonProgress(btn, 0, 'CleanFrame');
+        }, 4000);
+      }
+      // 3. Generic Errors
+      else {
+        UI.setButtonState(btn, 'error');
+      }
+
       activeJobs.delete(jobId);
       return;
     }
@@ -70,11 +95,13 @@
     UI.setButtonProgress(btn, 0.05, 'Starting…');
 
     try {
+      // Fire-and-forget: only wait for immediate ack — NOT the full pipeline.
       const response = await chrome.runtime.sendMessage({
         type: MSG.PROCESS_VIDEO,
         jobId,
         videoUrl,
         pageUrl: location.href,
+        platform: CFG.platform || 'flow',
         watermark: CFG.watermark,
         sourceMeta: {
           strategy: resolved.strategy,
@@ -84,24 +111,44 @@
       });
 
       if (response?.ok === false) {
-        // CORS / fetch failures surface here from the offscreen pipeline
-        const errText = response.error || 'Processing failed';
+        const errText = response.error || 'Failed to start processing';
         if (/cors|Failed to fetch|HTTP 403|HTTP 401/i.test(errText)) {
           throw new Error(
-            `${errText} — the HD URL may need cookies or a fresh download link. ` +
-              'Try opening the clip and using Flow’s Download once, then click CleanFrame again.'
+            `${errText} — the HD URL may need a fresh download link. ` +
+              'Try Flow’s Download once, then click CleanFrame again.'
           );
         }
         throw new Error(errText);
       }
 
-      if (response?.ok === true && response.done) {
-        UI.setButtonState(btn, 'done');
-        activeJobs.delete(jobId);
-      }
+      // Job accepted — UI updates continue via PROCESS_PROGRESS / DONE / ERROR
+      UI.setButtonProgress(btn, 0.08, 'Demuxing…');
+      console.info('[CleanFrame:content] job started', jobId, response?.status);
     } catch (err) {
       console.error('[CleanFrame:content] Process request failed', err);
-      UI.setButtonState(btn, 'error');
+
+      const errorMessage = String(err.message || err);
+
+      // 1. Handle Zombie Tabs (Extension Context Invalidated)
+      if (errorMessage.includes('Extension context invalidated')) {
+        UI.setButtonState(btn, 'error');
+        UI.setButtonProgress(btn, 1.0, 'Extension updated. Please refresh page!');
+      }
+      // 2. Handle Phantom Click Failure / Hidden Videos
+      else if (errorMessage.includes('No video URL found')) {
+        UI.setButtonState(btn, 'error');
+        UI.setButtonProgress(btn, 1.0, 'Click Flow Download First!');
+
+        setTimeout(() => {
+          UI.setButtonState(btn, 'ready');
+          UI.setButtonProgress(btn, 0, 'CleanFrame');
+        }, 4000);
+      }
+      // 3. Generic Errors
+      else {
+        UI.setButtonState(btn, 'error');
+      }
+
       activeJobs.delete(jobId);
     }
   }
@@ -109,7 +156,6 @@
   function onRuntimeMessage(message) {
     if (!message || !message.type) return;
 
-    // Background / MAIN-world may push newly seen media URLs
     if (message.type === MSG.MEDIA_SEEN && message.url) {
       Source?.rememberNetworkUrl?.(message.url, message.bytes);
       return;
@@ -144,9 +190,32 @@
 
     observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
+        const t = mutation.target;
+        if (
+          t?.closest?.('.cleanframe-host, .cleanframe-btn') ||
+          (t?.nodeType === 1 && t.classList?.contains('cleanframe-host'))
+        ) {
+          continue;
+        }
+
         if (mutation.type === 'childList' && mutation.addedNodes.length) {
-          scheduleScan();
-          return;
+          let relevant = false;
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            if (node.classList?.contains('cleanframe-host')) continue;
+            if (
+              node.querySelector?.('.cleanframe-host') &&
+              !node.querySelector?.('video, img')
+            ) {
+              continue;
+            }
+            relevant = true;
+            break;
+          }
+          if (relevant) {
+            scheduleScan();
+            return;
+          }
         }
         if (
           mutation.type === 'attributes' &&
@@ -174,7 +243,6 @@
     startObserver();
     scheduleScan();
 
-    // Flow is a SPA — re-scan on history changes
     const _push = history.pushState;
     const _replace = history.replaceState;
     history.pushState = function (...args) {
@@ -189,7 +257,9 @@
     };
     window.addEventListener('popstate', scheduleScan);
 
-    console.info(`[CleanFrame:content] v${CFG.version} ready on Flow (HD source resolver active)`);
+    console.info(
+      `[CleanFrame:content] v${CFG.version} ready (fire-and-forget messaging)`
+    );
   }
 
   if (document.readyState === 'loading') {

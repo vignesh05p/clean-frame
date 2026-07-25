@@ -15,28 +15,74 @@
     name: 'CleanFrame',
     version: '0.1.0',
 
-    /** Google Flow origins we operate on */
+    /** Supported origins and platform routing */
     hosts: Object.freeze([
       'labs.google.com',
       'labs.google',
+      'gemini.google.com',
+      'www.gemini.google.com',
     ]),
 
+    /** Detect platform from the current host (content contexts only) */
+    platform: (function () {
+      try {
+        if (typeof location !== 'undefined' && location && location.hostname) {
+          const h = location.hostname.toLowerCase();
+          if (h.includes('gemini.google.com') || h.includes('gemini.google')) return 'gemini';
+          if (h.includes('labs.google.com') || h.includes('labs.google')) return 'flow';
+        }
+      } catch (e) {
+        /* ignore */
+      }
+      return 'flow';
+    })(),
+
     /**
-     * Heuristic selectors for video cards / thumbnails on Flow.
-     * Ordered from most specific → most general. The injector tries each
-     * and only injects once per card (data-cleanframe-injected).
+     * Heuristic selectors for video cards / thumbnails. Platform-aware.
+     * Prefer leaf media cells — never the shared grid root.
      */
-    cardSelectors: Object.freeze([
-      '[data-testid*="video"]',
-      '[data-testid*="media"]',
-      '[data-testid*="asset"]',
-      '[data-testid*="generation"]',
-      'article:has(video)',
-      '[role="listitem"]:has(video)',
-      '[role="gridcell"]:has(video)',
-      'div:has(> video)',
-      'div:has(video[src]), div:has(video source)',
-    ]),
+    cardSelectors: (function () {
+      const base = [
+        '[data-test-id*="media"]',
+        '[data-testid*="card"]',
+        '[data-testid*="media"]',
+        '[data-testid*="tile"]',
+        '[class*="card"]',
+        '[class*="tile"]',
+        '[class*="grid-item"]',
+        '.relative.group',
+        'div:has(> video)',
+        'div:has(> img[src*="googleusercontent"])',
+        '[role="listitem"]:has(video)',
+        '[role="gridcell"]:has(video)',
+        'article:has(video)',
+      ];
+      try {
+        if (
+          typeof location !== 'undefined' &&
+          location.hostname &&
+          location.hostname.includes('gemini.google')
+        ) {
+          const gemini = [
+            '[role="listitem"]:has(img)',
+            '[data-testid*="assistant-message"] img',
+            '[data-testid*="assistant-message"] video',
+            '[data-testid*="media-overlay"]',
+            '.gemini-media, .media-overlay, [data-testid*="media"]',
+          ];
+          return Object.freeze(base.concat(gemini));
+        }
+      } catch (e) {
+        /* ignore */
+      }
+      return Object.freeze(base);
+    })(),
+
+    /** Platform-specific watermark masks (web_accessible resource names) */
+    platformMasks: Object.freeze({
+      flow: null,
+      gemini: 'gemini-mask.png',
+    }),
 
     /** Elements that usually expose a downloadable / playable video URL */
     videoSelectors: Object.freeze([
@@ -89,6 +135,8 @@
 
     messages: Object.freeze({
       ENSURE_OFFSCREEN: 'CLEANFRAME_ENSURE_OFFSCREEN',
+      /** Content -> SW: perform a HEAD probe for candidate URL (returns headers/status) */
+      HEAD_PROBE: 'CLEANFRAME_HEAD_PROBE',
       PROCESS_VIDEO: 'CLEANFRAME_PROCESS_VIDEO',
       PROCESS_PROGRESS: 'CLEANFRAME_PROCESS_PROGRESS',
       PROCESS_DONE: 'CLEANFRAME_PROCESS_DONE',
@@ -98,6 +146,12 @@
       LOOKUP_MEDIA: 'CLEANFRAME_LOOKUP_MEDIA',
       /** SW → content: a high-res media URL was observed on the network */
       MEDIA_SEEN: 'CLEANFRAME_MEDIA_SEEN',
+      /** Content → SW: register a pending phantom-click capture (carries requestId) */
+      PHANTOM_CLICK_START: 'CLEANFRAME_PHANTOM_CLICK_START',
+      /** Content → SW: arm phantom-click capture with optional cardUuid correlation */
+      EXPECT_CAPTURE: 'CLEANFRAME_EXPECT_CAPTURE',
+      /** SW → content: the redirect URL was captured for a pending requestId */
+      URL_SNIFFED: 'CLEANFRAME_URL_SNIFFED',
     }),
 
     /**

@@ -1,6 +1,9 @@
 /**
  * CleanFrame — offscreen document controller.
  * Receives PROCESS_VIDEO jobs and runs the streaming pipeline.
+ *
+ * Immediately acks job start; progress / done / error are pushed as
+ * separate messages so Chrome does not close a long-lived sendMessage port.
  */
 (function () {
   'use strict';
@@ -11,19 +14,39 @@
   const running = new Set();
 
   function emit(message) {
-    return chrome.runtime.sendMessage({ ...message, via: 'offscreen' });
+    return chrome.runtime.sendMessage({ ...message, via: 'offscreen' }).catch((e) => {
+      console.warn('[CleanFrame:offscreen] emit failed', e);
+    });
   }
 
   async function handleProcess(message) {
     const { jobId, videoUrl, watermark, tabId } = message;
     if (!jobId || !videoUrl) {
-      return { ok: false, error: 'jobId and videoUrl are required' };
+      await emit({
+        type: MSG.PROCESS_ERROR,
+        jobId,
+        tabId,
+        error: 'jobId and videoUrl are required',
+      });
+      return;
     }
     if (running.has(jobId)) {
-      return { ok: false, error: 'Job already running' };
+      await emit({
+        type: MSG.PROCESS_ERROR,
+        jobId,
+        tabId,
+        error: 'Job already running',
+      });
+      return;
     }
     if (!self.CleanFramePipeline?.processVideo) {
-      return { ok: false, error: 'Pipeline not loaded' };
+      await emit({
+        type: MSG.PROCESS_ERROR,
+        jobId,
+        tabId,
+        error: 'Pipeline not loaded',
+      });
+      return;
     }
 
     running.add(jobId);
@@ -39,11 +62,10 @@
     };
 
     try {
-      // Prefer File System Access when available (flat memory write path).
-      // Offscreen documents may not show a picker — fall back to Blob + downloads.
       let writable = null;
       let filename = `cleanframe-${jobId}.mp4`;
 
+      // Offscreen usually cannot show a file picker — prefer downloads fallback.
       if (typeof showSaveFilePicker === 'function') {
         try {
           const handle = await showSaveFilePicker({
@@ -58,7 +80,6 @@
           writable = await handle.createWritable();
           filename = handle.name || filename;
         } catch (pickerErr) {
-          // User cancel or unsupported — continue with downloads fallback
           if (pickerErr?.name === 'AbortError') {
             throw new Error('Save cancelled');
           }
@@ -66,10 +87,15 @@
         }
       }
 
+      const pipelineWatermark = { ...(watermark || {}) };
+      if (message.platform) pipelineWatermark.platform = message.platform;
+
+      onProgress(0.05, 'Fetching…');
+
       const result = await self.CleanFramePipeline.processVideo({
         jobId,
         videoUrl,
-        watermark,
+        watermark: pipelineWatermark,
         onProgress,
         writable,
       });
@@ -81,8 +107,6 @@
         filename: result.filename || filename,
         blobUrl: result.blobUrl,
       });
-
-      return { ok: true, done: true, ...result };
     } catch (err) {
       const error = String(err?.message || err);
       console.error('[CleanFrame:offscreen]', error);
@@ -92,7 +116,6 @@
         tabId,
         error,
       });
-      return { ok: false, error };
     } finally {
       running.delete(jobId);
     }
@@ -113,8 +136,10 @@
     }
 
     if (message.type === MSG.PROCESS_VIDEO) {
-      handleProcess(message).then(sendResponse);
-      return true;
+      // Ack immediately — run the heavy job without holding this channel open.
+      sendResponse({ ok: true, status: 'started', jobId: message.jobId });
+      handleProcess(message);
+      return; // sync response — do not return true
     }
   });
 

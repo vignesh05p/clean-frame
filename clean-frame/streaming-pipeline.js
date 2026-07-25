@@ -96,18 +96,16 @@
   }
 
   function normalizeCodec(codec) {
-    if (!codec) return 'avc1.42001f';
+    if (!codec) return 'avc1.4D4028';
     // Chrome only accepts short vp8 / vp9 labels
     if (codec.startsWith('vp08')) return 'vp8';
     if (codec.startsWith('vp09')) return 'vp9';
     return codec;
   }
 
-  function pickEncoderCodec(width, height) {
-    // Always re-encode to AVC for broad remux compatibility.
-    if (width * height >= 1920 * 1080) return 'avc1.640028'; // High@4.0
-    if (width * height >= 1280 * 720) return 'avc1.4D401F'; // Main@3.1
-    return 'avc1.42001E'; // Baseline@3.0
+  function pickEncoderCodec(_width, _height) {
+    // Always Main Profile, Level 4.0 — safely supports 720p and 1080p coded area
+    return 'avc1.4D4028';
   }
 
   /**
@@ -129,12 +127,53 @@
       throw new Error('WebCodecs API unavailable in this context');
     }
 
+    const lowerUrl = (videoUrl || '').toLowerCase();
+    if (/\.(webm|m3u8)(\?|$)/i.test(lowerUrl)) {
+      throw new Error(`Unsupported media format for MP4Box demuxer: ${videoUrl}`);
+    }
+
     onProgress(0.02, 'Fetching…');
     log(`job=${jobId} fetch ${videoUrl}`);
 
-    const response = await fetch(videoUrl, { credentials: 'include', mode: 'cors' });
+    // Pre-signed CDN URLs (Signature=…) must use credentials:'omit'.
+    // credentials:'include' + ACAO:* is a CORS error on flow-content.google*.
+    const response = await fetch(videoUrl, { credentials: 'omit', mode: 'cors' });
+    log('[CleanFrame:Diagnostic] response.type=', response.type, 'status=', response.status, 'url=', videoUrl.slice(0, 160));
+
+    if (response.type === 'opaque' || response.type === 'opaqueredirect') {
+      throw new Error('Opaque response received due to strict CORS. Cannot demux.');
+    }
+
+    try {
+      const headersDump = [];
+      response.headers.forEach((v, k) => headersDump.push(`${k}: ${v}`));
+      log('[CleanFrame:Diagnostic] response.headers:', headersDump.join(' | ') || '(none visible)');
+    } catch (e) {
+      warn('[CleanFrame:Diagnostic] cannot enumerate headers', e);
+    }
+
+    if (/\.webm(?:$|\?|#)/i.test(videoUrl) || /\.m3u8(?:$|\?|#)/i.test(videoUrl)) {
+      throw new Error('Unsupported media URL (WebM/HLS). CleanFrame requires progressive MP4. URL: ' + videoUrl.slice(0, 160));
+    }
+
     if (!response.ok) throw new Error(`Fetch failed: HTTP ${response.status}`);
     if (!response.body) throw new Error('ReadableStream body unavailable');
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.startsWith('image/')) {
+      throw new Error('Invalid video source. Server returned an image (' + contentType + '). The source resolver targeted a thumbnail instead of the video stream.');
+    }
+    if (/^image\//i.test(contentType)) {
+      throw new Error('Invalid video source (server returned image content): ' + contentType);
+    }
+    if (/text\/|application\/xml|application\/json/.test(contentType)) {
+      // CDN returned an error document — do not feed it to mp4box
+      const textContent = (await response.text()).slice(0, 200);
+      throw new Error(
+        'Invalid video source (Server returned ' + contentType + '): ' + textContent
+      );
+    }
+    log(`content-type=${contentType || '(none)'} — proceeding to demux`);
 
     const contentLength = Number(response.headers.get('content-length')) || 0;
     onProgress(0.06, 'Demuxing…');
@@ -171,18 +210,49 @@
     let frameChain = Promise.resolve();
     let inFlight = 0;
 
-    const encoderCodec = pickEncoderCodec(demux.width, demux.height);
-    const encoderConfig = {
+    // Force dimensions to be strictly even integers (Hardware encoders crash on odd numbers)
+    const encWidth = Math.max(2, Math.floor(demux.width / 2) * 2);
+    const encHeight = Math.max(2, Math.floor(demux.height / 2) * 2);
+
+    const encoderCodec = 'avc1.4D4028'; // Main@4.0 — never use Level 3.x for HD
+    let encoderConfig = {
       codec: encoderCodec,
-      width: demux.width,
-      height: demux.height,
+      width: encWidth,
+      height: encHeight,
       bitrate: CFG?.pipeline?.bitrate ?? 8_000_000,
       framerate: demux.framerate || 24,
       avc: { format: 'avc' },
       hardwareAcceleration: 'prefer-hardware',
     };
 
-    log('encoder configure', encoderConfig);
+    log('encoder configure (initial)', encoderConfig);
+
+    // Safely check if the browser/GPU supports this config
+    try {
+      const support = await VideoEncoder.isConfigSupported(encoderConfig);
+      if (!support.supported) {
+        warn('Primary encoder config rejected by GPU. Falling back to HD compatible profile...');
+        encoderConfig.codec = 'avc1.4D4028'; // Main Profile, Level 4.0 (Supports 720p/1080p)
+        encoderConfig.hardwareAcceleration = 'no-preference';
+      } else if (support.config?.codec) {
+        // Prefer browser-adjusted config, but never accept Level 3.x
+        const suggested = support.config.codec;
+        encoderConfig = { ...encoderConfig, ...support.config };
+        if (/1[Ee]$/i.test(suggested) || /42001[EeFf]$/i.test(suggested) || /42E01E/i.test(suggested)) {
+          warn('isConfigSupported suggested Level 3.x — forcing avc1.4D4028', suggested);
+          encoderConfig.codec = 'avc1.4D4028';
+        }
+      }
+    } catch (supportErr) {
+      warn('isConfigSupported check failed, attempting HD fallback anyway', supportErr);
+      encoderConfig.codec = 'avc1.4D4028';
+      encoderConfig.hardwareAcceleration = 'no-preference';
+    }
+
+    // Final hard guarantee — VideoEncoder must never see Level 3.0 / 3.1 Baseline
+    encoderConfig.codec = 'avc1.4D4028';
+    log('encoder configure (final)', encoderConfig);
+
     const encoder = new VideoEncoder({
       output: (chunk, meta) => {
         encodedChunks.push({ chunk, meta });
@@ -198,10 +268,15 @@
       },
       error: (e) => {
         encodeError = e;
-        error('encoder', e);
+        error('VideoEncoder failed during processing:', e);
       },
     });
-    encoder.configure(encoderConfig);
+
+    try {
+      encoder.configure(encoderConfig);
+    } catch (configErr) {
+      throw new Error(`Encoder creation error: ${configErr.message}`);
+    }
 
     const decoderConfig = {
       codec: demux.videoCodec,
@@ -327,8 +402,8 @@
       jobId,
       encodedChunks,
       audioTrack: demux.audioTrack,
-      width: demux.width,
-      height: demux.height,
+      width: encWidth,
+      height: encHeight,
       framerate: demux.framerate,
       writable,
       onProgress: (r) => onProgress(0.92 + r * 0.08, 'Saving…'),
@@ -339,8 +414,12 @@
   }
 
   /**
-   * Pipe a ReadableStream into mp4box and expose WebCodecs-ready video samples
+   * Demux an MP4 via true chunked streaming into WebCodecs-ready video samples
    * plus an untouched audio track for remux pass-through.
+   *
+   * Each chunk is copied to a detached ArrayBuffer with an accurate fileStart
+   * offset so mp4box can reconstruct atoms (including moov-at-end files once
+   * the stream completes and flush() runs).
    *
    * @param {ReadableStream<Uint8Array>} readable
    * @param {{ chunkBytes?: number, contentLength?: number, onProgress?: Function }} opts
@@ -371,6 +450,7 @@
     let bytesAppended = 0;
     let videoSamplesSeen = 0;
     let audioSamplesSeen = 0;
+    let readySettled = false;
 
     function wakeVideoWaiters() {
       while (videoWaiters.length) {
@@ -389,12 +469,14 @@
       file.onError = (e) => {
         demuxError = new Error(String(e));
         error('mp4box onError', e);
+        readySettled = true;
         wakeVideoWaiters();
         reject(demuxError);
       };
 
       file.onReady = (readyInfo) => {
         info = readyInfo;
+        readySettled = true;
         log('mp4box onReady', {
           duration: readyInfo.duration,
           timescale: readyInfo.timescale,
@@ -412,26 +494,32 @@
         videoTrackId = vTrack.id;
         videoTimescale = vTrack.timescale || 1;
 
-        const aTrack = readyInfo.audioTracks?.[0] || null;
-        if (aTrack) {
-          audioTrackId = aTrack.id;
-          audioMeta = {
-            id: aTrack.id,
-            codec: aTrack.codec,
-            timescale: aTrack.timescale,
-            duration: aTrack.duration,
-            sampleRate: aTrack.audio?.sample_rate || 48000,
-            channelCount: aTrack.audio?.channel_count || 2,
-            description: getAudioDescriptionBox(file, aTrack.id),
-            samples: audioSamples,
-          };
-          log(
-            `audio track id=${aTrack.id} codec=${aTrack.codec}` +
-              ` rate=${audioMeta.sampleRate} ch=${audioMeta.channelCount}` +
-              ` timescale=${aTrack.timescale}`
-          );
-        } else {
-          log('no audio track — video-only remux');
+        try {
+          const aTrack = readyInfo.audioTracks?.[0] || null;
+          if (aTrack) {
+            audioTrackId = aTrack.id;
+            audioMeta = {
+              id: aTrack.id,
+              codec: aTrack.codec,
+              timescale: aTrack.timescale,
+              duration: aTrack.duration,
+              sampleRate: aTrack.audio?.sample_rate || 48000,
+              channelCount: aTrack.audio?.channel_count || 2,
+              description: getAudioDescriptionBox(file, aTrack.id),
+              samples: audioSamples,
+            };
+            log(
+              `audio track id=${aTrack.id} codec=${aTrack.codec}` +
+                ` rate=${audioMeta.sampleRate} ch=${audioMeta.channelCount}` +
+                ` timescale=${aTrack.timescale}`
+            );
+          } else {
+            log('no audio track — video-only remux');
+          }
+        } catch (audioErr) {
+          warn('audio track metadata failed (continuing video-only)', audioErr);
+          audioTrackId = null;
+          audioMeta = null;
         }
 
         resolve(readyInfo);
@@ -440,136 +528,176 @@
       file.onSamples = (trackId, _user, samples) => {
         if (!samples?.length) return;
 
-        if (trackId === videoTrackId) {
-          for (const sample of samples) {
-            // Copy — mp4box may reuse underlying buffers
-            const data = copyToArrayBuffer(sample.data);
-            const timestamp = Math.round((1e6 * sample.cts) / sample.timescale);
-            const duration = Math.round(
-              (1e6 * (sample.duration || 0)) / sample.timescale
-            );
+        try {
+          if (trackId === videoTrackId) {
+            for (const sample of samples) {
+              const data = copyToArrayBuffer(sample.data);
+              const timestamp = Math.round((1e6 * sample.cts) / sample.timescale);
+              const duration = Math.round(
+                (1e6 * (sample.duration || 0)) / sample.timescale
+              );
 
-            videoQueue.push({
-              isKey: Boolean(sample.is_sync),
-              timestamp,
-              duration: duration || undefined,
-              data,
-            });
-            videoSamplesSeen += 1;
+              videoQueue.push({
+                isKey: Boolean(sample.is_sync),
+                timestamp,
+                duration: duration || undefined,
+                data,
+              });
+              videoSamplesSeen += 1;
+            }
+
+            if (videoSamplesSeen <= 3 || videoSamplesSeen % 120 === 0) {
+              log(
+                `onSamples video +${samples.length} total=${videoSamplesSeen}` +
+                  ` queue=${videoQueue.length}` +
+                  ` lastTs=${videoQueue[videoQueue.length - 1]?.timestamp}µs`
+              );
+            }
+            wakeVideoWaiters();
+            return;
           }
 
-          if (videoSamplesSeen <= 3 || videoSamplesSeen % 120 === 0) {
-            log(
-              `onSamples video +${samples.length} total=${videoSamplesSeen}` +
-                ` queue=${videoQueue.length}` +
-                ` lastTs=${videoQueue[videoQueue.length - 1]?.timestamp}µs`
-            );
+          if (trackId === audioTrackId) {
+            for (const sample of samples) {
+              audioSamples.push({
+                data: copyToArrayBuffer(sample.data),
+                duration: sample.duration || 1,
+                cts: sample.cts || 0,
+                dts: sample.dts ?? sample.cts ?? 0,
+                is_sync: sample.is_sync !== false,
+                timescale: sample.timescale,
+              });
+              audioSamplesSeen += 1;
+            }
+            if (audioSamplesSeen <= 2 || audioSamplesSeen % 200 === 0) {
+              log(
+                `onSamples audio +${samples.length} total=${audioSamplesSeen} (pass-through)`
+              );
+            }
           }
-          wakeVideoWaiters();
-          return;
-        }
-
-        if (trackId === audioTrackId) {
-          for (const sample of samples) {
-            audioSamples.push({
-              data: copyToArrayBuffer(sample.data),
-              duration: sample.duration || 1,
-              cts: sample.cts || 0,
-              dts: sample.dts ?? sample.cts ?? 0,
-              is_sync: sample.is_sync !== false,
-              timescale: sample.timescale,
-            });
-            audioSamplesSeen += 1;
-          }
-          if (audioSamplesSeen <= 2 || audioSamplesSeen % 200 === 0) {
-            log(
-              `onSamples audio +${samples.length} total=${audioSamplesSeen} (pass-through)`
-            );
-          }
+        } catch (sampleErr) {
+          warn('onSamples handler error', sampleErr);
         }
       };
     });
 
     /**
-     * Feed the fetch body into mp4box with correct fileStart offsets.
-     *
-     * For a single sequential ReadableStream we MUST advance fileStart by
-     * byteLength every chunk (same as the W3C WebCodecs demuxer sample).
-     * Jumping to appendBuffer's returned nextStart would mis-label later
-     * chunks unless we also issued HTTP range seeks — which we do not.
+     * True chunked streaming — append each fetch chunk with correct fileStart.
+     * Never buffers the whole file in RAM.
      */
     async function pumpStream() {
       const reader = readable.getReader();
-      let fileOffset = 0;
+      let offset = 0;
       let chunkIndex = 0;
 
       try {
         for (;;) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            log(
+              `stream EOF — appended ${(offset / (1024 * 1024)).toFixed(2)} MiB, flushing`
+            );
+            file.flush();
+            streamFinished = true;
+            bytesAppended = offset;
+            onProgress(1);
+            wakeVideoWaiters();
+            break;
+          }
           if (!value?.byteLength) continue;
 
-          // MP4Box requires a real ArrayBuffer with a fileStart property.
-          // Always copy — fetch chunks may be views into a larger pool.
-          const buffer = copyToArrayBuffer(value);
-          buffer.fileStart = fileOffset;
+          // mp4box requires a detached ArrayBuffer with a fileStart property
+          const ab = copyToArrayBuffer(value);
+          if (offset === 0) {
+            const head = value.subarray(0, Math.min(12, value.byteLength));
+            const hex = [...head].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+            const ascii = [...head].map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.')).join('');
+            console.log(`[CleanFrame:Diagnostic] First 12 bytes of file: [${hex}] | [${ascii}]`);
 
-          const nextStart = file.appendBuffer(buffer);
-          bytesAppended += buffer.byteLength;
+            const brand = String.fromCharCode(head[4] || 0, head[5] || 0, head[6] || 0, head[7] || 0);
+            if (!ascii.includes('ftyp') && brand !== 'ftyp') {
+              await reader.cancel?.();
+              throw new Error("Invalid file format. Expected MP4 'ftyp', but got: " + ascii);
+            }
+
+            if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) {
+              await reader.cancel?.();
+              throw new Error('Invalid file format: WebM/EBML detected. Pipeline requires MP4.');
+            }
+          }
+
+          try {
+            ab.fileStart = offset;
+            file.appendBuffer(ab);
+          } catch (e) {
+            await reader.cancel?.();
+            throw new Error(`mp4box appendBuffer failed at fileStart=${offset}: ${e?.message || e}`);
+          }
+
+          offset += ab.byteLength;
+          bytesAppended = offset;
           chunkIndex += 1;
 
           if (chunkIndex <= 3 || chunkIndex % 40 === 0) {
             log(
               `appendBuffer #${chunkIndex}`,
-              `fileStart=${fileOffset}`,
-              `size=${buffer.byteLength}`,
-              `mp4boxNextStart=${nextStart}`,
-              `totalMB=${(bytesAppended / (1024 * 1024)).toFixed(2)}`
-            );
-          }
-
-          // Sequential stream: advance by what we actually appended.
-          fileOffset += buffer.byteLength;
-
-          if (
-            typeof nextStart === 'number' &&
-            nextStart >= 0 &&
-            nextStart !== fileOffset
-          ) {
-            // Informative only — would need Range requests to honor seeks.
-            log(
-              `mp4box requested seek to ${nextStart} but stream is sequential;` +
-                ` continuing at ${fileOffset}`
+              `fileStart=${ab.fileStart}`,
+              `size=${ab.byteLength}`,
+              `totalMB=${(offset / (1024 * 1024)).toFixed(2)}`,
+              `ready=${readySettled}`
             );
           }
 
           if (contentLength > 0) {
-            onProgress(Math.min(0.99, bytesAppended / contentLength));
+            onProgress(Math.min(0.99, offset / contentLength));
           } else {
-            onProgress(Math.min(0.9, 1 - 1 / (1 + bytesAppended / (512 * 1024))));
+            onProgress(Math.min(0.9, 1 - 1 / (1 + offset / (512 * 1024))));
           }
         }
       } finally {
         reader.releaseLock?.();
       }
-
-      log(`stream EOF — appended ${(bytesAppended / (1024 * 1024)).toFixed(2)} MiB, flushing`);
-      file.flush();
-      streamFinished = true;
-      onProgress(1);
-      wakeVideoWaiters();
     }
 
-    // Start pumping immediately so moov can arrive; await ready in parallel.
-    const pumpPromise = pumpStream().catch((e) => {
-      demuxError = e instanceof Error ? e : new Error(String(e));
-      error('pumpStream failed', demuxError);
-      wakeVideoWaiters();
-      throw demuxError;
-    });
+    // Pump the entire stream first (moov may be at EOF). onReady may also
+    // fire mid-stream for fast-start files.
+    await pumpStream();
 
-    await readyPromise;
     if (demuxError) throw demuxError;
+
+    // Fail fast after flush if moov still missing
+    const READY_TIMEOUT_MS = 15_000;
+    const moovWarnTimer = setTimeout(() => {
+      if (!readySettled) {
+        warn('Waiting for MP4 moov atom… (file may be non-fast-start or corrupt)');
+        try {
+          file.flush();
+        } catch (e) {
+          warn('flush during moov wait failed', e);
+        }
+      }
+    }, 5_000);
+
+    try {
+      await Promise.race([
+        readyPromise,
+        sleep(READY_TIMEOUT_MS).then(() => {
+          if (!readySettled) {
+            throw new Error(
+              'Timed out waiting for MP4 moov atom 15s after stream flush. ' +
+                'File may be corrupt, truncated, or not an MP4.'
+            );
+          }
+        }),
+      ]);
+    } finally {
+      clearTimeout(moovWarnTimer);
+    }
+
+    if (demuxError) throw demuxError;
+    if (!info) throw new Error('mp4box onReady never fired');
+
+    onProgress(1);
 
     const vTrack = info.videoTracks[0];
     const width = vTrack.video?.width || vTrack.track_width;
@@ -608,64 +736,51 @@
       audioTrack: audioMeta,
       bytesAppended: () => bytesAppended,
 
-      /**
-       * Async iterator of demuxed video samples as WebCodecs-friendly objects.
-       * Starts extraction on first call; continues until stream flush + queue drain.
-       */
       async *videoSamples() {
         if (!extractionStarted) {
           extractionStarted = true;
 
-          // nbSamples: emit in batches to keep RAM flat but avoid tiny callbacks
-          file.setExtractionOptions(videoTrackId, null, { nbSamples: 60 });
-          log(`setExtractionOptions video track=${videoTrackId}`);
+          try {
+            file.setExtractionOptions(videoTrackId, null, { nbSamples: 60 });
+            log(`setExtractionOptions video track=${videoTrackId}`);
+          } catch (e) {
+            throw new Error(`Failed to set video extraction options: ${e}`);
+          }
 
           if (audioTrackId != null) {
-            file.setExtractionOptions(audioTrackId, null, { nbSamples: 100 });
-            log(`setExtractionOptions audio track=${audioTrackId} (pass-through)`);
+            try {
+              file.setExtractionOptions(audioTrackId, null, { nbSamples: 100 });
+              log(`setExtractionOptions audio track=${audioTrackId} (pass-through)`);
+            } catch (audioOptErr) {
+              warn('audio extraction options failed — skipping audio', audioOptErr);
+              audioTrackId = null;
+            }
           }
 
           file.start();
           log('mp4box extraction started');
         }
 
-        try {
-          for (;;) {
-            if (demuxError) throw demuxError;
+        for (;;) {
+          if (demuxError) throw demuxError;
 
-            if (videoQueue.length) {
-              yield videoQueue.shift();
-              continue;
-            }
-
-            // Wait for more samples or stream completion
-            if (streamFinished) {
-              // Give mp4box a turn to flush remaining samples after EOF
-              await sleep(0);
-              if (videoQueue.length) continue;
-
-              // Pump may still be settling
-              try {
-                await pumpPromise;
-              } catch {
-                /* demuxError already set */
-              }
-              if (demuxError) throw demuxError;
-              await sleep(0);
-              if (videoQueue.length) continue;
-
-              log(
-                `videoSamples done — yielded path complete,` +
-                  ` seen=${videoSamplesSeen} audioSeen=${audioSamplesSeen}`
-              );
-              return;
-            }
-
-            await Promise.race([waitForVideoSample(), pumpPromise.then(() => {})]);
+          if (videoQueue.length) {
+            yield videoQueue.shift();
+            continue;
           }
-        } finally {
-          // Ensure pump failures surface
-          await pumpPromise.catch(() => {});
+
+          if (streamFinished) {
+            await sleep(0);
+            if (videoQueue.length) continue;
+            await sleep(16);
+            if (videoQueue.length) continue;
+            log(
+              `videoSamples done — seen=${videoSamplesSeen} audioSeen=${audioSamplesSeen}`
+            );
+            return;
+          }
+
+          await waitForVideoSample();
         }
       },
     };
